@@ -1,0 +1,1362 @@
+name: snck
+
+on:
+ workflow_dispatch:
+  inputs:
+   reset_apps:
+    description: "Saved installed apps delete karke fresh Windows se shuru"
+    type: boolean
+    default: false
+
+permissions:
+ contents: write
+
+# Naya run tab tak wait kare jab tak purana run apna Final Save pura na kar le
+concurrency:
+ group: snck-rdp
+ cancel-in-progress: false
+
+jobs:
+ secure-rdp:
+  runs-on: windows-latest
+  timeout-minutes: 360
+  env:
+   GH_TOKEN: ${{ github.token }}
+   RDP_USER: snck
+   RDP_PASS: "snck"
+   RESET_APPS: ${{ inputs.reset_apps }}
+
+  steps:
+  - name: Checkout (Snck assets)
+    uses: actions/checkout@v4
+  - name: Stage Snck Assets (logo + wallpaper)
+    run: |
+     $ErrorActionPreference = "Continue"
+     New-Item -ItemType Directory -Force -Path "C:\ProgramData\snck-assets" | Out-Null
+     if (Test-Path "assets\snck-logo.png") {
+      Copy-Item "assets\snck-logo.png" "C:\ProgramData\snck-assets\logo.png" -Force
+      Write-Host "Snck logo staged."
+     } else { Write-Host "assets\snck-logo.png repo me nahi mila, badge bina logo ke chalega." }
+     $wpDir = "C:\RDPData\wallpaper"
+     New-Item -ItemType Directory -Force -Path $wpDir | Out-Null
+     $hasSaved = @(Get-ChildItem $wpDir -Filter "wall.*" -ErrorAction SilentlyContinue).Count -gt 0
+     if (-not $hasSaved -and (Test-Path "assets\snck-wallpaper.jpg")) {
+      Copy-Item "assets\snck-wallpaper.jpg" "$wpDir\wall.jpg" -Force
+      @{ style = "10"; tile = "0" } | ConvertTo-Json | Set-Content "$wpDir\settings.json"
+      Write-Host "Snck wallpaper seeded (pehli baar ke liye, agli baar jo wallpaper set hoga wahi save/restore hoga)."
+     } else { Write-Host "Wallpaper seed skip (pehle se saved hai ya asset nahi mila)." }
+     exit 0
+  - name: Restore Saved Data
+    run: |
+     $dir  = "C:\RDPData"
+     $repo = $env:GITHUB_REPOSITORY
+     $tar  = "$env:SystemRoot\System32\tar.exe"
+     @'
+     $ErrorActionPreference = "Continue"
+     function Get-AssetNames {
+      try { return @(gh release view rdp-data --repo $env:GITHUB_REPOSITORY --json assets -q ".assets[].name" 2>$null) } catch { return @() }
+     }
+     function Remove-Asset($n) {
+      gh release delete-asset rdp-data $n --repo $env:GITHUB_REPOSITORY --yes 2>&1 | Out-Null
+     }
+     function Split-File($file, $prefix, [long]$size) {
+      $in = [IO.File]::OpenRead($file)
+      $buf = New-Object byte[] (4MB)
+      $i = 0
+      $names = @()
+      while ($in.Position -lt $in.Length) {
+       $i++
+       $pn = "{0}.part{1:D3}" -f $prefix, $i
+       $o = [IO.File]::Create($pn)
+       [long]$written = 0
+       while ($written -lt $size -and $in.Position -lt $in.Length) {
+        $want = [int][Math]::Min([long]$buf.Length, [long]($size - $written))
+        $n = $in.Read($buf, 0, $want)
+        if ($n -le 0) { break }
+        $o.Write($buf, 0, $n)
+        $written += $n
+       }
+       $o.Close()
+       $names += $pn
+      }
+      $in.Close()
+      return $names
+     }
+     function Save-Archive($name, $baseDir, $sources, $excludes) {
+      $tar = "$env:SystemRoot\System32\tar.exe"
+      $d = "$env:TEMP\save"
+      New-Item -ItemType Directory -Force -Path $d | Out-Null
+      $f = "$d\$name"
+      Remove-Item $f -Force -ErrorAction SilentlyContinue
+      Get-ChildItem $d -Filter "$name.part*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+      $a = @("-czf", $f) + @($excludes) + @("-C", $baseDir) + @($sources)
+      & $tar @a
+      if (-not (Test-Path $f)) { Write-Host "$name ban hi nahi paya"; return }
+      $len = (Get-Item $f).Length
+      $mb = [math]::Round($len / 1MB)
+      $existing = @(Get-AssetNames)
+      if ($len -le 1800MB) {
+       gh release upload rdp-data $f --repo $env:GITHUB_REPOSITORY --clobber
+       if ($LASTEXITCODE -ne 0) { Write-Host "$name upload fail"; Remove-Item $f -Force -ErrorAction SilentlyContinue; return }
+       foreach ($n in $existing) { if ($n -like "$name.part*") { Remove-Asset $n } }
+       Write-Host "[$(Get-Date)] $name saved ($mb MB)"
+      } else {
+       $parts = @(Split-File $f "$d\$name" ([long]1800MB))
+       $ok = $true
+       foreach ($p in $parts) {
+        gh release upload rdp-data $p --repo $env:GITHUB_REPOSITORY --clobber
+        if ($LASTEXITCODE -ne 0) { $ok = $false; break }
+       }
+       if ($ok) {
+        $keep = @($parts | ForEach-Object { Split-Path $_ -Leaf })
+        foreach ($n in $existing) {
+         if ($n -eq $name -or ($n -like "$name.part*" -and $keep -notcontains $n)) { Remove-Asset $n }
+        }
+        Write-Host "[$(Get-Date)] $name saved in $($parts.Count) parts ($mb MB)"
+       } else { Write-Host "$name part upload fail, purana saved rakha" }
+       foreach ($p in $parts) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+      }
+      Remove-Item $f -Force -ErrorAction SilentlyContinue
+     }
+     function Restore-Archive($name, $dest) {
+      $tar = "$env:SystemRoot\System32\tar.exe"
+      $t = $env:TEMP
+      Remove-Item "$t\$name" -Force -ErrorAction SilentlyContinue
+      Get-ChildItem $t -Filter "$name.part*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+      gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern $name --dir $t --clobber 2>$null
+      if (-not (Test-Path "$t\$name")) {
+       gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern "$name.part*" --dir $t --clobber 2>$null
+       $parts = @(Get-ChildItem $t -Filter "$name.part*" -ErrorAction SilentlyContinue | Sort-Object Name)
+       if ($parts.Count -gt 0) {
+        $out = [IO.File]::Create("$t\$name")
+        foreach ($p in $parts) {
+         $in = [IO.File]::OpenRead($p.FullName)
+         $in.CopyTo($out)
+         $in.Close()
+         Remove-Item $p.FullName -Force -ErrorAction SilentlyContinue
+        }
+        $out.Close()
+       }
+      }
+      if (Test-Path "$t\$name") {
+       New-Item -ItemType Directory -Force -Path $dest | Out-Null
+       & $tar -xzf "$t\$name" -C $dest
+       Remove-Item "$t\$name" -Force -ErrorAction SilentlyContinue
+       return $true
+      }
+      return $false
+     }
+     function Get-AppSig($base, $src) {
+      $cnt = 0; $sum = [long]0; $mx = [long]0
+      foreach ($s in @($src)) {
+       $p = Join-Path $base ($s -replace '/', '\')
+       if (-not (Test-Path -LiteralPath $p)) { continue }
+       foreach ($f in @(Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        if ($f.FullName -match '(?i)cache|crashpad|\\logs\\') { continue }
+        $cnt++
+        $sum += $f.Length
+        $t = $f.LastWriteTimeUtc.Ticks
+        if ($t -gt $mx) { $mx = $t }
+       }
+      }
+      return "$cnt|$sum|$mx"
+     }
+     function Save-AppArchives($prof, [switch]$SigOnly) {
+      $exApp = @(
+       "--exclude=*Cache*", "--exclude=*cache*", "--exclude=Crashpad", "--exclude=GrShaderCache", "--exclude=ShaderCache",
+       "--exclude=AppData/Local/Google/Chrome",
+       "--exclude=AppData/Local/BraveSoftware",
+       "--exclude=AppData/Local/Microsoft/Windows",
+       "--exclude=AppData/Local/Microsoft/WindowsApps",
+       "--exclude=AppData/Roaming/Microsoft/Windows",
+       "--exclude=AppData/Roaming/.minecraft/assets",
+       "--exclude=AppData/Roaming/.minecraft/libraries",
+       "--exclude=AppData/Roaming/.minecraft/runtime",
+       "--exclude=AppData/Roaming/.minecraft/logs",
+       "--exclude=AppData/Roaming/.minecraft/webcache"
+      )
+      $sd = "C:\app-sigs"
+      New-Item -ItemType Directory -Force -Path $sd | Out-Null
+      $groups = @(
+       @{ pre = "al"; rel = "AppData/Local"; skip = @("Temp", "Packages", "CrashDumps", "D3DSCache", "PeerDistRepub", "VirtualStore", "ConnectedDevices", "History", "Application Data", "Temporary Internet Files", "INetCache") },
+       @{ pre = "ar"; rel = "AppData/Roaming"; skip = @() },
+       @{ pre = "ao"; rel = "AppData/LocalLow"; skip = @() }
+      )
+      foreach ($g in $groups) {
+       $root = Join-Path $prof ($g.rel -replace '/', '\')
+       if (-not (Test-Path -LiteralPath $root)) { continue }
+       $items = @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue | Where-Object {
+        -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and ($g.skip -notcontains $_.Name)
+       })
+       foreach ($it in $items) {
+        $src = "$($g.rel)/$($it.Name)"
+        $name = "$($g.pre)-" + ($it.Name -replace '[^A-Za-z0-9_-]', '_') + ".tgz"
+        $sig = Get-AppSig $prof @($src)
+        $sf = "$sd\$name.sig"
+        if ($SigOnly) { Set-Content -Path $sf -Value $sig -NoNewline; continue }
+        if ($sig -eq "0|0|0") { continue }
+        if ((Test-Path $sf) -and ((Get-Content $sf -Raw).Trim() -eq $sig)) { continue }
+        Save-Archive $name $prof @($src) $exApp
+        $have = @(Get-AssetNames | Where-Object { $_ -eq $name -or $_ -like "$name.part*" })
+        if ($have.Count -gt 0) { Set-Content -Path $sf -Value $sig -NoNewline }
+        else { Write-Host "$name save nahi hua, agli baar phir try hoga" }
+       }
+      }
+     }
+     '@ | Set-Content -Path "C:\persist-lib.ps1"
+     . "C:\persist-lib.ps1"
+     New-Item -ItemType Directory -Force -Path $dir | Out-Null
+     foreach ($f in "Desktop","Documents","Downloads","Pictures","Videos","Music") {
+      New-Item -ItemType Directory -Force -Path "$dir\$f" | Out-Null
+     }
+     @'
+     $ErrorActionPreference = "Continue"
+     . "C:\persist-lib.ps1"
+     $prof = $null
+     $sid = $null
+     try {
+      $sid = (Get-LocalUser -Name $env:RDP_USER).SID.Value
+      $prof = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath
+     } catch {}
+     if (-not $prof) { $prof = "C:\Users\$env:RDP_USER" }
+     Write-Host "Profile path: $prof"
+     if (Test-Path "C:\save-apps.ps1") { & "C:\save-apps.ps1" }
+     try {
+      $wpDir = "C:\RDPData\wallpaper"
+      New-Item -ItemType Directory -Force -Path $wpDir | Out-Null
+      $cur = $null; $style = "10"; $tile = "0"
+      if ($sid) {
+       $hk = "Registry::HKEY_USERS\$sid\Control Panel\Desktop"
+       if (Test-Path $hk) {
+        $dp = Get-ItemProperty $hk
+        $cur = $dp.Wallpaper
+        if ($dp.WallpaperStyle) { $style = "$($dp.WallpaperStyle)" }
+        if ($dp.TileWallpaper) { $tile = "$($dp.TileWallpaper)" }
+       }
+      }
+      if (-not $cur -or -not (Test-Path $cur)) { $cur = "$prof\AppData\Roaming\Microsoft\Windows\Themes\TranscodedWallpaper" }
+      if (Test-Path $cur) {
+       $ext = [IO.Path]::GetExtension($cur); if (-not $ext) { $ext = ".jpg" }
+       $dest = "$wpDir\wall$ext"
+       if ($cur -ne $dest) {
+        Get-ChildItem $wpDir -Filter "wall.*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Copy-Item $cur $dest -Force
+       }
+       @{ style = $style; tile = $tile } | ConvertTo-Json | Set-Content "$wpDir\settings.json"
+       Write-Host "Wallpaper saved: $cur"
+      } else { Write-Host "Wallpaper file nahi mili, purana saved wallpaper rakha" }
+     } catch { Write-Host "Wallpaper save fail: $_" }
+     try {
+      $hiv = "$env:TEMP\settings.hiv"
+      Remove-Item $hiv -Force -ErrorAction SilentlyContinue
+      if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) {
+       reg save "HKU\$sid" $hiv /y | Out-Null
+      } elseif (Test-Path "$prof\NTUSER.DAT") {
+       Copy-Item "$prof\NTUSER.DAT" $hiv -Force -ErrorAction SilentlyContinue
+      }
+      if (Test-Path $hiv) {
+       gh release upload rdp-data $hiv --repo $env:GITHUB_REPOSITORY --clobber
+       Write-Host "[$(Get-Date)] Windows settings saved"
+      } else { Write-Host "Settings hive nahi bana, purana saved rakha" }
+     } catch { Write-Host "Settings save fail: $_" }
+     if (Test-Path "C:\save-ts.ps1") { & "C:\save-ts.ps1" }
+     try {
+      $ms = "$env:TEMP\machstage"
+      Remove-Item $ms -Recurse -Force -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path "$ms\mach" | Out-Null
+      $mkeys = @(
+       "HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation",
+       "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp",
+       "HKLM\SOFTWARE\Policies",
+       "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies"
+      )
+      $mi = 0
+      foreach ($mk in $mkeys) { $mi++; reg export $mk "$ms\mach\k$mi.reg" /y 2>&1 | Out-Null }
+      Save-Archive "machine.tgz" $ms @("mach") @()
+     } catch { Write-Host "machine settings save fail: $_" }
+     Save-Archive "data.tgz" "C:\RDPData" @(".") @()
+     # PEHLE apps (Discord etc.) save hote hain, har app ka alag chhota archive, sirf changed wale
+     try { Save-AppArchives $prof } catch { Write-Host "App archives save fail: $_" }
+     $exB = @("--exclude=*Cache*", "--exclude=*cache*", "--exclude=Crashpad", "--exclude=GrShaderCache", "--exclude=ShaderCache")
+     $browsers = @(
+      @{ n = "chrome.tgz";  p = @("AppData/Local/Google/Chrome") },
+      @{ n = "brave.tgz";   p = @("AppData/Local/BraveSoftware") },
+      @{ n = "shell.tgz";   p = @("AppData/Roaming/Microsoft/Windows/Start Menu", "AppData/Roaming/Microsoft/Windows/Themes", "AppData/Roaming/Microsoft/Windows/SendTo", "AppData/Roaming/Microsoft/Windows/Libraries", "AppData/Roaming/Microsoft/Windows/Templates", "AppData/Roaming/Microsoft/Internet Explorer/Quick Launch") },
+      @{ n = "fonts.tgz";   p = @("AppData/Local/Microsoft/Windows/Fonts") }
+     )
+     foreach ($b in $browsers) {
+      $have = @($b.p | Where-Object { Test-Path -LiteralPath ("$prof\" + ($_ -replace "/", "\")) })
+      if ($have.Count -gt 0) { Save-Archive $b.n $prof $have $exB }
+      else { Write-Host "$($b.n): data nahi mila, skip" }
+     }
+     $skipRoot = @("AppData", "Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music", "OneDrive", "Application Data", "Local Settings", "My Documents", "Cookies", "NetHood", "PrintHood", "Recent", "SendTo", "Start Menu", "Templates")
+     $rootItems = @(Get-ChildItem $prof -Force -ErrorAction SilentlyContinue | Where-Object {
+      -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and ($skipRoot -notcontains $_.Name) -and ($_.Name -notlike "NTUSER*") -and ($_.Name -notlike "ntuser*")
+     } | ForEach-Object { $_.Name })
+     if ($rootItems.Count -gt 0) { Save-Archive "profile.tgz" $prof $rootItems @("--exclude=*Cache*", "--exclude=*cache*") }
+     exit 0
+     '@ | Set-Content -Path "C:\save-data.ps1"
+     @'
+     $ErrorActionPreference = "Continue"
+     try {
+      $tsDir = "$env:ProgramData\Tailscale"
+      if (-not (Test-Path "$tsDir\server-state.conf")) { Write-Host "Tailscale state file nahi mili, save skip"; exit 0 }
+      $stage = "$env:TEMP\tsstage"
+      Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path "$stage\Tailscale" | Out-Null
+      Get-ChildItem $tsDir -File -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName "$stage\Tailscale\" -Force -ErrorAction SilentlyContinue }
+      if (-not (Test-Path "$stage\Tailscale\server-state.conf")) { Write-Host "Tailscale state copy nahi hui, save skip"; exit 0 }
+      $f = "$env:TEMP\tailscale-state.tgz"
+      Remove-Item $f -Force -ErrorAction SilentlyContinue
+      & "$env:SystemRoot\System32\tar.exe" -czf $f -C $stage Tailscale
+      gh release upload rdp-data $f --repo $env:GITHUB_REPOSITORY --clobber
+      Write-Host "[$(Get-Date)] Tailscale state saved"
+     } catch { Write-Host "Tailscale state save fail: $_" }
+     exit 0
+     '@ | Set-Content -Path "C:\save-ts.ps1"
+     reg load HKU\DefTmp "C:\Users\Default\NTUSER.DAT" | Out-Null
+     $k = "Registry::HKEY_USERS\DefTmp\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+     if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
+     $map = @{
+      "Desktop" = "Desktop"
+      "Personal" = "Documents"
+      "{374DE290-123F-4565-9164-39C4925E467B}" = "Downloads"
+      "My Pictures" = "Pictures"
+      "My Video" = "Videos"
+      "My Music" = "Music"
+     }
+     foreach ($n in $map.Keys) {
+      Set-ItemProperty -Path $k -Name $n -Value "$dir\$($map[$n])" -Type ExpandString
+     }
+     [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+     Start-Sleep -Seconds 2
+     reg unload HKU\DefTmp | Out-Null
+     gh release view rdp-data --repo $repo *> $null
+     if ($LASTEXITCODE -ne 0) {
+      gh release create rdp-data --repo $repo --title "RDP data" --notes "Saved RDP data. Delete mat karna."
+      Write-Host "Pehli baar run hai, purana data nahi hai."
+     } else {
+      if (Restore-Archive "data.tgz" $dir) {
+       Write-Host "Purana data restore ho gaya."
+      } else {
+       gh release download rdp-data --repo $repo --pattern data.zip --dir $env:TEMP --clobber
+       if (Test-Path "$env:TEMP\data.zip") {
+        Expand-Archive "$env:TEMP\data.zip" -DestinationPath $dir -Force
+        Write-Host "Purana data.zip restore ho gaya."
+       } else {
+        Write-Host "Abhi tak koi data save nahi hua."
+       }
+      }
+     }
+     exit 0
+  - name: Restore Machine Settings
+    run: |
+     . "C:\persist-lib.ps1"
+     $t = "$env:TEMP\mach-restore"
+     Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue
+     if (Restore-Archive "machine.tgz" $t) {
+      foreach ($r in @(Get-ChildItem "$t\mach" -Filter "*.reg" -ErrorAction SilentlyContinue)) {
+       reg import $r.FullName 2>&1 | Out-Null
+      }
+      Write-Host "Machine settings restore ho gayi."
+     } else { Write-Host "Machine settings abhi tak save nahi hui." }
+     exit 0
+  - name: Fresh Windows Cleanup
+    run: |
+     . "C:\persist-lib.ps1"
+     $names = @(Get-AssetNames)
+     if (($names -notcontains "fresh-v2.flag") -or ($env:RESET_APPS -eq "true")) {
+      Write-Host "Purane saved apps (VS Code/Antigravity etc.) clear kar rahe hain"
+      foreach ($n in $names) { if ($n -like "apps-files*" -or $n -like "apps-meta*") { Remove-Asset $n } }
+      Set-Content -Path "$env:TEMP\fresh-v2.flag" -Value "ok" -NoNewline
+      gh release upload rdp-data "$env:TEMP\fresh-v2.flag" --repo $env:GITHUB_REPOSITORY --clobber
+     }
+     foreach ($d in "C:\RDPData\Desktop", "C:\Users\Public\Desktop") {
+      foreach ($pat in "Visual Studio Code*", "Antigravity*", "Codex*", "ChatGPT*", "Microsoft Edge*", "Firefox*") {
+       Get-ChildItem $d -Filter "$pat.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+      }
+     }
+     @'
+     $ErrorActionPreference = "Continue"
+     $procs = @()
+     $ff = "C:\Program Files\Mozilla Firefox\uninstall\helper.exe"
+     if (Test-Path $ff) { $procs += Start-Process $ff -ArgumentList "/S" -PassThru }
+     $vs = "C:\Program Files\Microsoft VS Code\unins000.exe"
+     if (Test-Path $vs) { $procs += Start-Process $vs -ArgumentList "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES" -PassThru }
+     $edge = Get-ChildItem "C:\Program Files (x86)\Microsoft\Edge\Application" -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -match '^\d' } |
+      ForEach-Object { Join-Path $_.FullName "Installer\setup.exe" } |
+      Where-Object { Test-Path $_ } | Select-Object -First 1
+     if ($edge) { $procs += Start-Process $edge -ArgumentList "--uninstall", "--system-level", "--verbose-logging", "--force-uninstall" -PassThru }
+     foreach ($p in $procs) { if (-not $p.WaitForExit(120000)) { try { $p.Kill() } catch {} } }
+     $sm = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
+     foreach ($pat in "Firefox*", "Microsoft Edge*") { Get-ChildItem $sm -Filter "$pat.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue }
+     Remove-Item "$sm\Visual Studio Code" -Recurse -Force -ErrorAction SilentlyContinue
+     Set-Content -Path "C:\cleanup.done" -Value "ok"
+     '@ | Set-Content -Path "C:\fresh-cleanup.ps1"
+     Remove-Item "C:\cleanup.done" -Force -ErrorAction SilentlyContinue
+     Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\fresh-cleanup.ps1"
+     Write-Host "Cleanup background me shuru (Firefox/Edge/VS Code uninstall)."
+     exit 0
+  - name: Configure Core RDP Settings
+    run: |
+     Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+         -Name "fDenyTSConnections" -Value 0 -Force
+     Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+         -Name "UserAuthentication" -Value 0 -Force
+     Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+         -Name "SecurityLayer" -Value 0 -Force
+     netsh advfirewall firewall delete rule name="RDP-Tailscale"
+     netsh advfirewall firewall add rule name="RDP-Tailscale" `
+     dir=in action=allow protocol=TCP localport=3389
+     $tsp = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+     New-Item -Path $tsp -Force | Out-Null
+     $pol = @{
+      "fClientDisableUDP" = 0
+      "SelectTransport" = 0
+      "VGOptimization_CaptureFrameRate" = 2
+      "AVC444ModePreferred" = 0
+      "AVCHardwareEncodePreferred" = 1
+      "bEnumerateHWBeforeSW" = 1
+      "fEnableVirtualizedGraphics" = 1
+      "fDisableCompression" = 0
+      "MaxCompressionLevel" = 2
+      "fEnableLossyCompression" = 1
+      "ImageQuality" = 2
+      "fEnableSuperPan" = 1
+     }
+     foreach ($name in $pol.Keys) {
+      Set-ItemProperty -Path $tsp -Name $name -Value $pol[$name] -Type DWord -Force
+     }
+     Restart-Service -Name TermService -Force
+  - name: Performance Boost
+    run: |
+     $ErrorActionPreference = "Continue"
+     Write-Host "RAM: $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)) GB, CPU cores: $((Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors)"
+     try { powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>&1 | Out-Null; Write-Host "High performance power plan on" } catch {}
+     try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue; Write-Host "Defender realtime off" } catch {}
+     foreach ($svc in "SysMain", "WSearch", "DiagTrack", "wuauserv", "UsoSvc") {
+      try { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue; Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue } catch {}
+     }
+     try {
+      Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" -Name "Win32PrioritySeparation" -Value 38 -Force
+      Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" -Name "DisablePagingExecutive" -Value 1 -Force
+      Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "fEnableVirtualizedGraphics" -Value 1 -Force -ErrorAction SilentlyContinue
+     } catch {}
+     try {
+      $sp = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+      Set-ItemProperty -Path $sp -Name "NetworkThrottlingIndex" -Value ([int]-1) -Type DWord -Force
+      Set-ItemProperty -Path $sp -Name "SystemResponsiveness" -Value 0 -Type DWord -Force
+     } catch {}
+     try {
+      Set-MpPreference -DisableIOAVProtection $true -DisableBehaviorMonitoring $true -DisableScriptScanning $true -DisableBlockAtFirstSeen $true -MAPSReporting 0 -SubmitSamplesConsent 2 -ErrorAction SilentlyContinue
+      Add-MpPreference -ExclusionPath "C:\" -ErrorAction SilentlyContinue
+     } catch {}
+     foreach ($svc in "DoSvc", "WerSvc", "MapsBroker") {
+      try { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue; Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue } catch {}
+     }
+     try {
+      powercfg /change monitor-timeout-ac 0 | Out-Null
+      powercfg /change standby-timeout-ac 0 | Out-Null
+      powercfg /hibernate off | Out-Null
+     } catch {}
+     try {
+      netsh int tcp set global autotuninglevel=normal | Out-Null
+      netsh int tcp set global rss=enabled | Out-Null
+      netsh int tcp set global ecncapability=disabled | Out-Null
+     } catch {}
+     Write-Host "Performance tweaks applied."
+     exit 0
+  - name: Fix Mic, Audio, Wallpaper and Extra Smoothness
+    run: |
+     $ErrorActionPreference = "Continue"
+     # ---- 1) Audio services (Windows Server me default band hoti hain => mic/speaker kaam nahi karta) ----
+     foreach ($svc in "AudioEndpointBuilder", "Audiosrv") {
+      try { Set-Service -Name $svc -StartupType Automatic -ErrorAction Stop; Start-Service -Name $svc -ErrorAction SilentlyContinue } catch { Write-Host "Audio svc fail: $svc" }
+     }
+     # ---- 2) RDP audio + mic redirection allow ----
+     $tsp = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+     New-Item -Path $tsp -Force | Out-Null
+     foreach ($n in "fDisableAudioCapture", "fDisableCam", "fDisableCdm", "fNoRemoteDesktopWallpaper") {
+      Set-ItemProperty -Path $tsp -Name $n -Value 0 -Type DWord -Force
+     }
+     Set-ItemProperty -Path $tsp -Name "fDisableCdm" -Value 0 -Type DWord -Force
+     $wsk = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+     foreach ($n in "fDisableAudioCapture", "fDisableAudio") {
+      Set-ItemProperty -Path $wsk -Name $n -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+     }
+     # ---- 3) Windows privacy: microphone access allow ----
+     $cs = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+     New-Item -Path $cs -Force | Out-Null
+     Set-ItemProperty -Path $cs -Name "Value" -Value "Allow" -Type String -Force
+     $ap = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"
+     New-Item -Path $ap -Force | Out-Null
+     Set-ItemProperty -Path $ap -Name "LetAppsAccessMicrophone" -Value 1 -Type DWord -Force
+     Write-Host "Audio + mic redirection enabled."
+     # ---- 4) Smoother RDP: AVC444 band (kam bandwidth), 60fps rakho ----
+     Set-ItemProperty -Path $tsp -Name "AVC444ModePreferred" -Value 0 -Type DWord -Force
+     Set-ItemProperty -Path $tsp -Name "VGOptimization_CaptureFrameRate" -Value 2 -Type DWord -Force
+     # ---- 5) Security off (sirf is temporary VM ke liye, Tailscale ke peeche) ----
+     try {
+      $df = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
+      New-Item -Path "$df\Real-Time Protection" -Force | Out-Null
+      Set-ItemProperty -Path $df -Name "DisableAntiSpyware" -Value 1 -Type DWord -Force
+      Set-ItemProperty -Path "$df\Real-Time Protection" -Name "DisableRealtimeMonitoring" -Value 1 -Type DWord -Force
+      $ss = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
+      New-Item -Path $ss -Force | Out-Null
+      Set-ItemProperty -Path $ss -Name "EnableSmartScreen" -Value 0 -Type DWord -Force
+      Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "ConsentPromptBehaviorAdmin" -Value 0 -Type DWord -Force
+      Write-Host "Defender policy off, SmartScreen off, UAC prompt off."
+     } catch { Write-Host "Security off fail: $_" }
+     # ---- 6) Extra background services band (RDP/audio/network ko touch nahi karte) ----
+     foreach ($svc in "Spooler", "Fax", "XblAuthManager", "XblGameSave", "XboxNetApiSvc", "XboxGipSvc", "RetailDemo", "PhoneSvc", "lfsvc", "SharedAccess", "WMPNetworkSvc", "TrkWks") {
+      try { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue; Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue } catch {}
+     }
+     # ---- 7) Wallpaper har RDP login par apply karne wali script ----
+     @'
+     $ErrorActionPreference = "SilentlyContinue"
+     Start-Sleep -Seconds 4
+     $k = "HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+     New-Item -Path $k -Force | Out-Null
+     Set-ItemProperty -Path $k -Name "Value" -Value "Allow" -Type String -Force
+     $wp = Get-ChildItem "C:\RDPData\wallpaper" -Filter "wall.*" | Select-Object -First 1
+     if (-not $wp) { exit }
+     $style = "10"; $tile = "0"
+     if (Test-Path "C:\RDPData\wallpaper\settings.json") {
+      $j = Get-Content "C:\RDPData\wallpaper\settings.json" -Raw | ConvertFrom-Json
+      if ($j.style) { $style = "$($j.style)" }
+      if ($j.tile) { $tile = "$($j.tile)" }
+     }
+     $d = "HKCU:\Control Panel\Desktop"
+     Set-ItemProperty -Path $d -Name WallpaperStyle -Value $style
+     Set-ItemProperty -Path $d -Name TileWallpaper -Value $tile
+     Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class SnckWP { [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int SystemParametersInfo(int a, int b, string c, int d); }'
+     for ($i = 0; $i -lt 3; $i++) {
+      [SnckWP]::SystemParametersInfo(20, 0, $wp.FullName, 3) | Out-Null
+      Start-Sleep -Seconds 5
+     }
+     '@ | Set-Content -Path "C:\ProgramData\snck-wallpaper.ps1"
+     Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "SnckWallpaper" -Value 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\ProgramData\snck-wallpaper.ps1"'
+     Write-Host "Wallpaper logon script ready."
+     exit 0
+  - name: Create RDP User (snck)
+    run: |
+     $user = $env:RDP_USER
+     $pass = $env:RDP_PASS
+     try {
+      secedit /export /cfg C:\secpol.cfg | Out-Null
+      (Get-Content C:\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' -replace 'MinimumPasswordLength = \d+', 'MinimumPasswordLength = 0' | Set-Content C:\secpol.cfg
+      secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY | Out-Null
+     } catch { Write-Host "Password policy change fail: $_" }
+     $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
+     if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+      Set-LocalUser -Name $user -Password $securePass
+     } else {
+      try {
+       New-LocalUser -Name $user -Password $securePass -AccountNeverExpires -PasswordNeverExpires | Out-Null
+      } catch {
+       Write-Host "New-LocalUser fail ($_), net user se try kar rahe hain"
+       net user $user "$pass" /add /y
+      }
+     }
+     Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
+     Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+     if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+      Write-Error "User creation failed"
+      exit 1
+     }
+     Write-Host "User '$user' ready."
+  - name: Create Profile and Restore App Data
+    run: |
+     Add-Type -TypeDefinition @"
+     using System;
+     using System.Text;
+     using System.Runtime.InteropServices;
+     public class UserProf {
+      [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+      public static extern int CreateProfile(
+       [MarshalAs(UnmanagedType.LPWStr)] string pszUserSid,
+       [MarshalAs(UnmanagedType.LPWStr)] string pszUserName,
+       [Out][MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszProfilePath,
+       uint cchProfilePath);
+     }
+     "@
+     $sid = (Get-LocalUser -Name $env:RDP_USER).SID.Value
+     Write-Host "RDP user SID: $sid"
+     gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern last-sid.txt --dir $env:TEMP --clobber 2>$null
+     if (Test-Path "$env:TEMP\last-sid.txt") {
+      $oldSid = (Get-Content "$env:TEMP\last-sid.txt" -Raw).Trim()
+      if ($oldSid -eq $sid) { Write-Host "SID SAME HAI: saved login (Chrome/VS Code) chal sakte hain" }
+      else { Write-Host "SID BADLA (purana $oldSid): Windows-encrypted login is machine par nahi chalega" }
+     }
+     Set-Content -Path "$env:TEMP\last-sid.txt" -Value $sid -NoNewline
+     gh release upload rdp-data "$env:TEMP\last-sid.txt" --repo $env:GITHUB_REPOSITORY --clobber
+     $sb  = New-Object System.Text.StringBuilder 260
+     $hr  = [UserProf]::CreateProfile($sid, $env:RDP_USER, $sb, 260)
+     Write-Host "CreateProfile result: $hr  path: $sb"
+     $prof = $null
+     try {
+      $prof = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath
+     } catch {}
+     if (-not $prof) {
+      Write-Host "PROFILE NAHI BANA - AppData restore skip (varna login par galat profile ban sakta hai)"
+      exit 0
+     }
+     Write-Host "Profile path: $prof"
+     . "C:\persist-lib.ps1"
+     # purane (legacy) archives pehle, phir naye per-app archives upar se overwrite karte hain
+     foreach ($name in "appdata.tgz", "chrome.tgz", "brave.tgz", "shell.tgz", "fonts.tgz", "applocal.tgz", "approaming.tgz", "applow.tgz", "profile.tgz") {
+      if (Restore-Archive $name $prof) { Write-Host "$name restore ho gaya." }
+      else { Write-Host "$name abhi tak save nahi hua." }
+     }
+     $appNames = @(Get-AssetNames | ForEach-Object { $_ -replace '\.part\d+$', '' } | Where-Object { $_ -match '^(al|ar|ao)-.+\.tgz$' } | Sort-Object -Unique)
+     foreach ($name in $appNames) {
+      if (Restore-Archive $name $prof) { Write-Host "$name restore ho gaya." }
+      else { Write-Host "$name restore nahi hua." }
+     }
+     try { Save-AppArchives $prof -SigOnly } catch { Write-Host "sig init fail: $_" }
+     Write-Host "AppData\Local after restore: $((Get-ChildItem "$prof\AppData\Local" -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ', ')"
+     try {
+      $ErrorActionPreference = "Continue"
+      gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern settings.hiv --dir $env:TEMP --clobber 2>$null
+      $hiv  = "$env:TEMP\settings.hiv"
+      $hive = "$prof\NTUSER.DAT"
+      if ((Test-Path $hiv) -and (Test-Path $hive)) {
+       reg load HKU\RdpNew "$hive" | Out-Null
+       reg load HKU\RdpOld "$hiv" | Out-Null
+       $cv = "Software\Microsoft\Windows\CurrentVersion"
+       $keys = @(
+        "Control Panel", "Environment", "Keyboard Layout",
+        "$cv\Themes", "$cv\Search", "$cv\Run", "$cv\Uninstall", "$cv\Policies",
+        "$cv\Explorer\Advanced", "$cv\Explorer\Accent", "$cv\Explorer\StuckRects3",
+        "$cv\Explorer\Taskband", "$cv\Explorer\CabinetState", "$cv\Explorer\HideDesktopIcons",
+        "$cv\Explorer\Ribbon", "$cv\Explorer\StartPage", "$cv\Explorer\StartPage2",
+        "Software\Microsoft\Windows\DWM", "Console", "Network", "Printers",
+        "$cv\Explorer\FileExts", "$cv\Explorer\RecentDocs", "$cv\Explorer\TypedPaths",
+        "$cv\Explorer\Wallpapers", "$cv\Explorer\VisualEffects", "$cv\Explorer\ComDlg32",
+        "$cv\Explorer\Streams", "$cv\Applets", "$cv\Notifications\Settings",
+        "Software\Microsoft\Windows NT\CurrentVersion\Fonts"
+       )
+       foreach ($k in $keys) {
+        if (Test-Path -LiteralPath "Registry::HKEY_USERS\RdpOld\$k") {
+         reg copy "HKU\RdpOld\$k" "HKU\RdpNew\$k" /s /f | Out-Null
+        }
+       }
+       foreach ($v in @(Get-ChildItem "Registry::HKEY_USERS\RdpOld\Software" -ErrorAction SilentlyContinue)) {
+        $vn = $v.PSChildName
+        if ($vn -in "Microsoft", "Classes", "Policies", "Wow6432Node") { continue }
+        reg copy "HKU\RdpOld\Software\$vn" "HKU\RdpNew\Software\$vn" /s /f | Out-Null
+       }
+       $msDeny = @("Windows", "Windows NT", "Cryptography", "SystemCertificates", "IdentityCRL", "Protected Storage System Provider", "Windows Defender", "Active Setup", "CTF", "Input", "InputPersonalization", "Personalization", "Multimedia", "MSF", "Speech", "SystemSettings", "Internet Explorer", "OneDrive", "WindowsRuntime")
+       foreach ($v in @(Get-ChildItem "Registry::HKEY_USERS\RdpOld\Software\Microsoft" -ErrorAction SilentlyContinue)) {
+        $vn = $v.PSChildName
+        if ($msDeny -contains $vn) { continue }
+        reg copy "HKU\RdpOld\Software\Microsoft\$vn" "HKU\RdpNew\Software\Microsoft\$vn" /s /f | Out-Null
+       }
+       [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+       Start-Sleep -Seconds 2
+       reg unload HKU\RdpOld | Out-Null
+       reg unload HKU\RdpNew | Out-Null
+       Write-Host "Windows settings restore ho gayi."
+      } else { Write-Host "Saved Windows settings abhi nahi hain, skip" }
+     } catch { Write-Host "Settings restore fail: $_" }
+     try {
+      $wp = Get-ChildItem "C:\RDPData\wallpaper" -Filter "wall.*" -ErrorAction SilentlyContinue | Select-Object -First 1
+      $hive = "$prof\NTUSER.DAT"
+      if ($wp -and (Test-Path $hive)) {
+       $style = "10"; $tile = "0"
+       if (Test-Path "C:\RDPData\wallpaper\settings.json") {
+        $j = Get-Content "C:\RDPData\wallpaper\settings.json" -Raw | ConvertFrom-Json
+        if ($j.style) { $style = "$($j.style)" }
+        if ($j.tile) { $tile = "$($j.tile)" }
+       }
+       reg load HKU\RdpWall "$hive" | Out-Null
+       $k = "Registry::HKEY_USERS\RdpWall\Control Panel\Desktop"
+       Set-ItemProperty -Path $k -Name Wallpaper -Value $wp.FullName
+       Set-ItemProperty -Path $k -Name WallpaperStyle -Value $style
+       Set-ItemProperty -Path $k -Name TileWallpaper -Value $tile
+       [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+       Start-Sleep -Seconds 2
+       reg unload HKU\RdpWall | Out-Null
+       Write-Host "Wallpaper restore set: $($wp.FullName)"
+      } else { Write-Host "Saved wallpaper abhi nahi hai, skip" }
+     } catch { Write-Host "Wallpaper restore fail: $_" }
+     exit 0
+  - name: Hide Watermark and Add Snck Badge
+    run: |
+     $ErrorActionPreference = "Continue"
+     try {
+      $sid = (Get-LocalUser -Name $env:RDP_USER).SID.Value
+      $prof = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath
+      $hive = "$prof\NTUSER.DAT"
+      if (Test-Path $hive) {
+       reg load HKU\RdpWM "$hive" | Out-Null
+       $k = "Registry::HKEY_USERS\RdpWM\Control Panel\Desktop"
+       Set-ItemProperty -Path $k -Name PaintDesktopVersion -Value 0 -Type DWord
+       try {
+        $k2 = "Registry::HKEY_USERS\RdpWM"
+        Set-ItemProperty -Path $k -Name MenuShowDelay -Value "0" -Type String
+        Set-ItemProperty -Path $k -Name UserPreferencesMask -Value ([byte[]](0x90,0x12,0x03,0x80,0x10,0x00,0x00,0x00)) -Type Binary
+        foreach ($pair in @(
+         @("$k2\Control Panel\Desktop\WindowMetrics", "MinAnimate", "0", "String"),
+         @("$k2\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects", "VisualFXSetting", 2, "DWord"),
+         @("$k2\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "EnableTransparency", 0, "DWord"),
+         @("$k2\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "TaskbarAnimations", 0, "DWord"),
+         @("$k2\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "ListviewAlphaSelect", 0, "DWord"),
+         @("$k2\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "ListviewShadow", 0, "DWord"),
+         @("$k2\Software\Microsoft\Windows\DWM", "EnableAeroPeek", 0, "DWord")
+        )) {
+         if (-not (Test-Path -LiteralPath $pair[0])) { New-Item -Path $pair[0] -Force | Out-Null }
+         Set-ItemProperty -LiteralPath $pair[0] -Name $pair[1] -Value $pair[2] -Type $pair[3] -Force
+        }
+        Write-Host "Visual effects off (fast RDP) set."
+       } catch { Write-Host "Visual effects tweak fail: $_" }
+       [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+       Start-Sleep -Seconds 2
+       reg unload HKU\RdpWM | Out-Null
+       Write-Host "Windows Server version text hide set."
+      }
+     } catch { Write-Host "Watermark hide fail: $_" }
+     @'
+     $created = $false
+     $mx = New-Object System.Threading.Mutex($true, "Local\SnckBadge", [ref]$created)
+     if (-not $created) { exit }
+     Add-Type -AssemblyName System.Windows.Forms
+     Add-Type -AssemblyName System.Drawing
+     Add-Type -ReferencedAssemblies System.Windows.Forms,System.Drawing -TypeDefinition @"
+     using System;
+     using System.Drawing;
+     using System.Drawing.Drawing2D;
+     using System.Drawing.Text;
+     using System.Windows.Forms;
+     public class BadgeForm : Form {
+      System.Windows.Forms.Timer tm = new System.Windows.Forms.Timer();
+      float t = 0;
+      DateTime start = DateTime.Now;
+      Image logo = null;
+      public BadgeForm() {
+       SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+       FormBorderStyle = FormBorderStyle.None;
+       ShowInTaskbar = false;
+       TopMost = true;
+       StartPosition = FormStartPosition.Manual;
+       Size = new Size(230, 62);
+       BackColor = Color.FromArgb(12, 14, 22);
+       Opacity = 0.99;
+       Region = new Region(Round(new Rectangle(0, 0, Width, Height), 16));
+       try {
+        string lp = "C:\\ProgramData\\snck-assets\\logo.png";
+        if (System.IO.File.Exists(lp)) {
+         using (var fs = new System.IO.FileStream(lp, System.IO.FileMode.Open, System.IO.FileAccess.Read))
+          logo = Image.FromStream(fs);
+        }
+       } catch { logo = null; }
+       tm.Interval = 66;
+       tm.Tick += delegate { t += 0.066f; Invalidate(); };
+       tm.Start();
+      }
+      static GraphicsPath Round(Rectangle r, int d) {
+       GraphicsPath p = new GraphicsPath();
+       p.AddArc(r.X, r.Y, d, d, 180, 90);
+       p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+       p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+       p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+       p.CloseFigure();
+       return p;
+      }
+      protected override CreateParams CreateParams {
+       get {
+        CreateParams cp = base.CreateParams;
+        cp.ExStyle |= 0x08000000 | 0x80 | 0x20 | 0x80000;
+        return cp;
+       }
+      }
+      protected override bool ShowWithoutActivation { get { return true; } }
+      protected override void OnFormClosing(FormClosingEventArgs e) {
+       if (e.CloseReason != CloseReason.WindowsShutDown) { e.Cancel = true; }
+       base.OnFormClosing(e);
+      }
+      protected override void OnPaint(PaintEventArgs e) {
+       Graphics g = e.Graphics;
+       g.SmoothingMode = SmoothingMode.AntiAlias;
+       g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+       Rectangle rc = new Rectangle(0, 0, Width, Height);
+       using (LinearGradientBrush bg = new LinearGradientBrush(rc, Color.FromArgb(16, 20, 34), Color.FromArgb(7, 9, 15), 45f))
+        g.FillRectangle(bg, rc);
+       // rotating gradient border
+       using (LinearGradientBrush bb = new LinearGradientBrush(rc, Color.FromArgb(46, 204, 113), Color.FromArgb(0, 200, 255), (t * 70f) % 360f)) {
+        ColorBlend cb = new ColorBlend(4);
+        cb.Colors = new Color[] { Color.FromArgb(46, 204, 113), Color.FromArgb(0, 200, 255), Color.FromArgb(155, 89, 255), Color.FromArgb(46, 204, 113) };
+        cb.Positions = new float[] { 0f, 0.33f, 0.66f, 1f };
+        bb.InterpolationColors = cb;
+        using (Pen bp = new Pen(bb, 3f))
+        using (GraphicsPath bpath = Round(new Rectangle(2, 2, Width - 5, Height - 5), 14))
+         g.DrawPath(bp, bpath);
+       }
+       // pulsing dot with expanding rings
+       float cx = 19f, cy = Height / 2f;
+       for (int k = 0; k < 3; k++) {
+        float ph = (t * 0.7f + k / 3f) % 1f;
+        float r = 5f + ph * 11f;
+        int al = (int)((1f - ph) * 150f);
+        using (Pen rp = new Pen(Color.FromArgb(al, 46, 204, 113), 1.5f))
+         g.DrawEllipse(rp, cx - r, cy - r, 2 * r, 2 * r);
+       }
+       double pulse = 0.5 + 0.5 * Math.Sin(t * 4.0);
+       int gr = 170 + (int)(pulse * 60);
+       using (SolidBrush db = new SolidBrush(Color.FromArgb(40, gr, 100)))
+        g.FillEllipse(db, cx - 5, cy - 5, 10, 10);
+       // brand logo
+       if (logo != null) { g.DrawImage(logo, 36, 11, 20, 20); }
+       // shimmering title
+       using (Font f1 = new Font("Segoe UI", 12, FontStyle.Bold))
+       using (Font f2 = new Font("Segoe UI", 7, FontStyle.Regular)) {
+        float period = 110f;
+        using (LinearGradientBrush tb = new LinearGradientBrush(new RectangleF(0, 0, period, 10), Color.FromArgb(46, 204, 113), Color.White, 0f)) {
+         ColorBlend tc = new ColorBlend(3);
+         tc.Colors = new Color[] { Color.FromArgb(46, 204, 113), Color.White, Color.FromArgb(46, 204, 113) };
+         tc.Positions = new float[] { 0f, 0.5f, 1f };
+         tb.InterpolationColors = tc;
+         tb.WrapMode = WrapMode.Tile;
+         tb.TranslateTransform((t * 120f) % period, 0);
+         g.DrawString("SNCK RDP", f1, tb, 60, 6);
+        }
+        TimeSpan up = DateTime.Now - start;
+        string sub = "ONLINE  " + string.Format("{0:00}:{1:00}:{2:00}", (int)up.TotalHours, up.Minutes, up.Seconds);
+        using (SolidBrush sb = new SolidBrush(Color.FromArgb(160, 175, 195)))
+         g.DrawString(sub, f2, sb, 62, 32);
+       }
+       // bouncing bars
+       for (int i = 0; i < 4; i++) {
+        float h = 5f + 14f * (float)(0.5 + 0.5 * Math.Sin(t * 5.0 + i * 1.3));
+        using (SolidBrush bs = new SolidBrush(Color.FromArgb(200, 46, 204, 113)))
+         g.FillRectangle(bs, Width - 34 + i * 7, Height / 2f + 10 - h, 4, h);
+       }
+      }
+     }
+     "@
+     [System.Windows.Forms.Application]::EnableVisualStyles()
+     $f = New-Object BadgeForm
+     function Place {
+      $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+      $f.Location = New-Object System.Drawing.Point(($wa.Right - $f.Width - 12), ($wa.Bottom - $f.Height - 12))
+      $f.TopMost = $true
+     }
+     Place
+     $t = New-Object System.Windows.Forms.Timer
+     $t.Interval = 15000
+     $t.Add_Tick({ Place })
+     $t.Start()
+     [System.Windows.Forms.Application]::Run($f)
+     '@ | Set-Content -Path "C:\ProgramData\snck-badge.ps1" -Encoding UTF8
+     @'
+     CreateObject("WScript.Shell").Run "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""C:\ProgramData\snck-badge.ps1""", 0, False
+     '@ | Set-Content -Path "C:\ProgramData\snck-badge.vbs" -Encoding ASCII
+     Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "SnckBadge" -Value 'wscript.exe "C:\ProgramData\snck-badge.vbs"'
+     # Re-apply the watermark hide live at every logon too: the offline hive edit above can get
+     # silently reset the first time the profile fully initializes, so this is a live backstop.
+     # It runs a few seconds after logon (via the task's own delay, not a Run-key race) and
+     # restarts explorer.exe once so the desktop fully repaints without the eval/build text.
+     @'
+     $ErrorActionPreference = "Continue"
+     try {
+      Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name PaintDesktopVersion -Value 0 -Type DWord -Force
+      Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name AppsUseLightTheme -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+      Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name SystemUsesLightTheme -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+      rundll32.exe user32.dll,UpdatePerUserSystemParameters 1, True
+      Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force
+      Start-Sleep -Seconds 1
+      Start-Process explorer.exe
+     } catch {}
+     '@ | Set-Content -Path "C:\ProgramData\snck-hide-wm.ps1" -Encoding UTF8
+     try {
+      Unregister-ScheduledTask -TaskName "SnckHideWMWatchdog" -Confirm:$false -ErrorAction SilentlyContinue
+      $wact = New-ScheduledTaskAction -Execute "powershell.exe" -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\ProgramData\snck-hide-wm.ps1"'
+      $wtrg = New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\$env:RDP_USER"
+      $wtrg.Delay = "PT5S"
+      $wpri = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$env:RDP_USER" -LogonType Interactive -RunLevel Highest
+      $wset = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -AllowStartIfOnBatteries
+      Register-ScheduledTask -TaskName "SnckHideWMWatchdog" -Action $wact -Trigger $wtrg -Principal $wpri -Settings $wset -Force | Out-Null
+      Write-Host "Watermark-hide watchdog task ban gaya (har logon par ek baar chalega)."
+     } catch { Write-Host "Watermark-hide task fail: $_" }
+     try {
+      Unregister-ScheduledTask -TaskName "SnckBadgeWatchdog" -Confirm:$false -ErrorAction SilentlyContinue
+      $act  = New-ScheduledTaskAction -Execute "wscript.exe" -Argument '"C:\ProgramData\snck-badge.vbs"'
+      $trg1 = New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\$env:RDP_USER"
+      $trg2 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+      $pri  = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$env:RDP_USER" -LogonType Interactive -RunLevel Highest
+      $set  = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -AllowStartIfOnBatteries
+      Register-ScheduledTask -TaskName "SnckBadgeWatchdog" -Action $act -Trigger @($trg1, $trg2) -Principal $pri -Settings $set -Force | Out-Null
+      Write-Host "Badge watchdog task ban gaya (har 1 min check, band hua to wapas aa jayega)."
+     } catch { Write-Host "Watchdog task fail: $_" }
+     Write-Host "Snck badge set, RDP login par dikhega."
+     exit 0
+  - name: Install Tailscale and Restore Saved Login
+    run: |
+     $ErrorActionPreference = "Continue"
+     $msi = "$env:TEMP\tailscale.msi"
+     $urls = @("https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi",
+               "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi")
+     foreach ($u in $urls) {
+      for ($t = 0; $t -lt 3 -and -not (Test-Path $msi); $t++) {
+       try { Invoke-WebRequest -Uri $u -OutFile $msi -UseBasicParsing -ErrorAction Stop } catch { Start-Sleep -Seconds 3 }
+      }
+      if (Test-Path $msi) { break }
+     }
+     if (-not (Test-Path $msi)) { Write-Error "Tailscale download fail"; exit 1 }
+     Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+     Remove-Item $msi -Force -ErrorAction SilentlyContinue
+     for ($i = 0; $i -lt 30; $i++) {
+      $svc = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+      if ($svc -and $svc.Status -eq "Running") { break }
+      Start-Sleep -Seconds 2
+     }
+     gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern tailscale-state.tgz --dir $env:TEMP --clobber 2>$null
+     if (Test-Path "$env:TEMP\tailscale-state.tgz") {
+      Stop-Service -Name "Tailscale" -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 3
+      & "$env:SystemRoot\System32\tar.exe" -xzf "$env:TEMP\tailscale-state.tgz" -C "$env:ProgramData"
+      Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 5
+      Write-Host "Purana Tailscale login restore ho gaya."
+     } else {
+      Write-Host "Pehli baar hai, Tailscale login ek baar karna padega."
+     }
+     exit 0
+  - name: Install Extra Apps (apps.txt)
+    run: |
+     $ErrorActionPreference = "Continue"
+     $list = "C:\RDPData\apps.txt"
+     if (-not (Test-Path $list)) { Write-Host "apps.txt nahi hai, skip"; exit 0 }
+     foreach ($line in Get-Content $list) {
+      $l = $line.Trim()
+      if (-not $l -or $l.StartsWith("#")) { continue }
+      Write-Host "=== $l ==="
+      try {
+       if ($l -like "choco:*") { choco install $l.Substring(6) -y --no-progress; continue }
+       if ($l -match '^https?://') {
+        $ext = if ($l -match '\.msi($|\?)') { ".msi" } else { ".exe" }
+        $f = "$env:TEMP\" + [guid]::NewGuid().ToString("N") + $ext
+        Invoke-WebRequest -Uri $l -OutFile $f
+       } elseif ($l -like "file:*") {
+        $f = Join-Path "C:\RDPData" $l.Substring(5)
+       } else {
+        choco install $l -y --no-progress; continue
+       }
+       if (-not (Test-Path $f)) { Write-Host "File nahi mili: $f"; continue }
+       if ($f -like "*.msi") {
+        $p = Start-Process msiexec -ArgumentList "/i", "`"$f`"", "/qn", "/norestart", "ALLUSERS=1" -PassThru
+       } else {
+        $p = Start-Process $f -ArgumentList "/S", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/ALLUSERS" -PassThru
+       }
+       if (-not $p.WaitForExit(300000)) { $p.Kill(); Write-Host "Timeout (5 min): $l" }
+       else { Write-Host "Done, exit code: $($p.ExitCode)" }
+      } catch { Write-Host "Fail: $l -> $_" }
+     }
+     exit 0
+  - name: App Capture - Baseline lo aur purane installed apps restore karo
+    run: |
+     $ErrorActionPreference = "Continue"
+     $tar = "$env:SystemRoot\System32\tar.exe"
+     for ($i = 0; $i -lt 70 -and -not (Test-Path "C:\cleanup.done"); $i++) { Start-Sleep -Seconds 2 }
+     Write-Host "Cleanup done: $(Test-Path 'C:\cleanup.done')"
+     @'
+     function Get-Names($p, [switch]$Dir) {
+      if (-not (Test-Path -LiteralPath $p)) { return @() }
+      if ($Dir) { return @(Get-ChildItem -LiteralPath $p -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) }
+      return @(Get-ChildItem -LiteralPath $p -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+     }
+     function Get-Names2($p) {
+      $o = @()
+      foreach ($t in @(Get-ChildItem -LiteralPath $p -Directory -Force -ErrorAction SilentlyContinue)) {
+       foreach ($c in @(Get-ChildItem -LiteralPath $t.FullName -Directory -Force -ErrorAction SilentlyContinue)) { $o += "$($t.Name)/$($c.Name)" }
+      }
+      return $o
+     }
+     function Get-Keys($p) {
+      if (-not (Test-Path -LiteralPath $p)) { return @() }
+      return @(Get-ChildItem -LiteralPath $p -ErrorAction SilentlyContinue | ForEach-Object { $_.PSChildName })
+     }
+     function Get-New($cur, $base) {
+      $hs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+      foreach ($b in @($base)) { if ($null -ne $b) { [void]$hs.Add([string]$b) } }
+      return @(@($cur) | Where-Object { $_ -and -not $hs.Contains([string]$_) })
+     }
+     function Get-AppState {
+      $cv   = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion"
+      $cv32 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion"
+      $mev = @{}
+      $me = [Environment]::GetEnvironmentVariables("Machine")
+      foreach ($k in $me.Keys) { if ($k -ne "Path") { $mev["$k"] = "$($me[$k])" } }
+      return @{
+       pf       = (Get-Names "C:\Program Files" -Dir)
+       pf86     = (Get-Names "C:\Program Files (x86)" -Dir)
+       pf2      = (Get-Names2 "C:\Program Files")
+       pf862    = (Get-Names2 "C:\Program Files (x86)")
+       cf       = (Get-Names "C:\Program Files\Common Files" -Dir)
+       cf86     = (Get-Names "C:\Program Files (x86)\Common Files" -Dir)
+       pd       = (Get-Names "C:\ProgramData" -Dir)
+       sm       = (Get-Names "C:\ProgramData\Microsoft\Windows\Start Menu\Programs")
+       pub      = (Get-Names "C:\Users\Public\Desktop")
+       dd       = @(Get-Names "D:\")
+       cr       = @(Get-Names "C:\" -Dir)
+       sw       = (Get-Keys "HKLM:\SOFTWARE")
+       sw32     = (Get-Keys "HKLM:\SOFTWARE\WOW6432Node")
+       unin     = (Get-Keys "$cv\Uninstall")
+       unin32   = (Get-Keys "$cv32\Uninstall")
+       apppaths = (Get-Keys "$cv\App Paths")
+       cls      = (Get-Keys "HKLM:\SOFTWARE\Classes")
+       svc      = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+       path     = @(([Environment]::GetEnvironmentVariable("Path", "Machine")) -split ';' | Where-Object { $_ })
+       mev      = $mev
+      }
+     }
+     '@ | Set-Content -Path "C:\app-lib.ps1"
+     @'
+     $ErrorActionPreference = "Continue"
+     $tar = "$env:SystemRoot\System32\tar.exe"
+     if (-not (Test-Path "C:\baseline-apps.json") -or -not (Test-Path "C:\apps-restored.flag")) {
+      Write-Host "App capture: baseline/restore abhi pura nahi hua, save skip"
+      exit 0
+     }
+     . "C:\app-lib.ps1"
+     $base = Get-Content "C:\baseline-apps.json" -Raw | ConvertFrom-Json
+     $cur  = Get-AppState
+     $stage = "$env:TEMP\appcap"
+     Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+     New-Item -ItemType Directory -Force -Path "$stage\reg" | Out-Null
+     $skipPd = @("Package Cache", "Microsoft", "Windows", "USOPrivate", "USOShared", "SoftwareDistribution", "ssh", "Packages", "regid*")
+     $dirs = New-Object System.Collections.ArrayList
+     foreach ($n in (Get-New $cur.pf   $base.pf))   { [void]$dirs.Add("Program Files/$n") }
+     foreach ($n in (Get-New $cur.pf86 $base.pf86)) { [void]$dirs.Add("Program Files (x86)/$n") }
+     $skipTop = @("Windows*", "WindowsApps", "ModifiableWindowsApps", "Common Files", "Internet Explorer", "WindowsPowerShell", "Reference Assemblies", "MSBuild", "dotnet", "Microsoft Update Health Tools")
+     $newTop64 = @(Get-New $cur.pf   $base.pf)
+     $newTop86 = @(Get-New $cur.pf86 $base.pf86)
+     if ($null -ne $base.pf2) {
+      foreach ($n in (Get-New $cur.pf2 $base.pf2)) {
+       $t = ($n -split '/')[0]
+       if ($newTop64 -contains $t) { continue }
+       if ($skipTop | Where-Object { $t -like $_ }) { continue }
+       [void]$dirs.Add("Program Files/$n")
+      }
+     }
+     if ($null -ne $base.pf862) {
+      foreach ($n in (Get-New $cur.pf862 $base.pf862)) {
+       $t = ($n -split '/')[0]
+       if ($newTop86 -contains $t) { continue }
+       if ($skipTop | Where-Object { $t -like $_ }) { continue }
+       [void]$dirs.Add("Program Files (x86)/$n")
+      }
+     }
+     foreach ($n in (Get-New $cur.cf   $base.cf))   { [void]$dirs.Add("Program Files/Common Files/$n") }
+     foreach ($n in (Get-New $cur.cf86 $base.cf86)) { [void]$dirs.Add("Program Files (x86)/Common Files/$n") }
+     foreach ($n in (Get-New $cur.pd   $base.pd))   { if (-not ($skipPd | Where-Object { $n -like $_ })) { [void]$dirs.Add("ProgramData/$n") } }
+     foreach ($n in (Get-New $cur.sm   $base.sm))   { [void]$dirs.Add("ProgramData/Microsoft/Windows/Start Menu/Programs/$n") }
+     foreach ($n in (Get-New $cur.pub  $base.pub))  { [void]$dirs.Add("Users/Public/Desktop/$n") }
+     $skipCr = @("RDPData", "Users", "Windows", "Program Files", "Program Files (x86)", "ProgramData", '$Recycle.Bin', "System Volume Information", "Recovery", "PerfLogs", "Documents and Settings", "hostedtoolcache", "Temp", "tmp")
+     foreach ($n in (Get-New $cur.cr $base.cr)) { if (-not ($skipCr -contains $n)) { [void]$dirs.Add($n) } }
+     $skipDd = @("a", "System Volume Information", '$RECYCLE.BIN', "pagefile.sys", "swapfile.sys", "hiberfil.sys", "DATALOSS_WARNING_README.txt")
+     $ddirs = New-Object System.Collections.ArrayList
+     if (Test-Path "D:\") {
+      foreach ($n in (Get-New $cur.dd $base.dd)) { if (-not ($skipDd -contains $n)) { [void]$ddirs.Add($n) } }
+     }
+     $script:i = 0
+     function Export-Key($key) {
+      $script:i++
+      reg export $key "$stage\reg\k_$($script:i).reg" /y 2>&1 | Out-Null
+     }
+     $cvp   = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion"
+     $cv32p = "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion"
+     foreach ($n in (Get-New $cur.sw       $base.sw))       { Export-Key "HKLM\SOFTWARE\$n" }
+     foreach ($n in (Get-New $cur.sw32     $base.sw32))     { Export-Key "HKLM\SOFTWARE\WOW6432Node\$n" }
+     foreach ($n in (Get-New $cur.unin     $base.unin))     { Export-Key "$cvp\Uninstall\$n" }
+     foreach ($n in (Get-New $cur.unin32   $base.unin32))   { Export-Key "$cv32p\Uninstall\$n" }
+     foreach ($n in (Get-New $cur.apppaths $base.apppaths)) { Export-Key "$cvp\App Paths\$n" }
+     foreach ($n in (Get-New $cur.cls      $base.cls))      {
+      if ($n -like "AppX*" -or $n -eq "Local Settings" -or $n -eq "PackagedCom") { continue }
+      Export-Key "HKLM\SOFTWARE\Classes\$n"
+     }
+     $svcInfo = @()
+     foreach ($n in (Get-New $cur.svc $base.svc)) {
+      $s = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+      if ($s -and $s.PathName -and ($s.PathName -notmatch '(?i)\\Windows\\')) {
+       $svcInfo += [pscustomobject]@{ Name = $s.Name; DisplayName = $s.DisplayName; PathName = $s.PathName; StartMode = $s.StartMode }
+       Export-Key "HKLM\SYSTEM\CurrentControlSet\Services\$n"
+      }
+     }
+     ConvertTo-Json -InputObject @($svcInfo) | Set-Content "$stage\services.json"
+     $newPath = Get-New $cur.path $base.path
+     ConvertTo-Json -InputObject @($newPath) | Set-Content "$stage\path.json"
+     $envDiff = @{}
+     foreach ($k in $cur.mev.Keys) {
+      if ($k -eq "ChocolateyLastPathUpdate") { continue }
+      if ("$($base.mev.$k)" -ne "$($cur.mev[$k])") { $envDiff[$k] = $cur.mev[$k] }
+     }
+     $envDiff | ConvertTo-Json | Set-Content "$stage\env.json"
+     $sb = New-Object System.Text.StringBuilder
+     foreach ($d in $dirs) {
+      $m = Get-ChildItem -LiteralPath ("C:\" + ($d -replace '/', '\')) -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum
+      [void]$sb.Append("$d|$($m.Count)|$($m.Sum);")
+     }
+     foreach ($d in $ddirs) {
+      $m = Get-ChildItem -LiteralPath ("D:\" + $d) -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum
+      [void]$sb.Append("D:$d|$($m.Count)|$($m.Sum);")
+     }
+     foreach ($f in (Get-ChildItem $stage -Recurse -File | Sort-Object FullName)) {
+      [void]$sb.Append((Get-FileHash $f.FullName -Algorithm MD5).Hash)
+     }
+     $sha = [System.Security.Cryptography.SHA1]::Create()
+     $sig = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($sb.ToString())))
+     if ((Test-Path "C:\apps-sig.txt") -and ((Get-Content "C:\apps-sig.txt" -Raw).Trim() -eq $sig)) {
+      Write-Host "App capture: koi naya change nahi, upload skip"
+      exit 0
+     }
+     $ff = "$env:TEMP\apps-files.tgz"
+     Remove-Item $ff -Force -ErrorAction SilentlyContinue
+     if ($dirs.Count -gt 0) {
+      & $tar -czf $ff -C "C:\" $dirs
+      if (Test-Path $ff) {
+       $mb = [math]::Round((Get-Item $ff).Length / 1MB)
+       if ($mb -gt 1900) { Write-Host "apps-files $mb MB hai, 2 GB limit ke paas, save skip" }
+       else {
+        gh release upload rdp-data $ff --repo $env:GITHUB_REPOSITORY --clobber
+        Write-Host "[$(Get-Date)] Installed apps files saved ($mb MB, $($dirs.Count) folders/items)"
+       }
+      }
+     } else {
+      Write-Host "Koi naya app folder nahi mila, purana saved apps-files.tgz waisa hi rakha (delete nahi kiya)"
+     }
+     $fd = "$env:TEMP\apps-files-d.tgz"
+     Remove-Item $fd -Force -ErrorAction SilentlyContinue
+     if ($ddirs.Count -gt 0) {
+      & $tar -czf $fd -C "D:\" $ddirs
+      if (Test-Path $fd) {
+       $mbd = [math]::Round((Get-Item $fd).Length / 1MB)
+       if ($mbd -gt 1900) { Write-Host "apps-files-d $mbd MB hai, 2 GB limit ke paas, save skip" }
+       else {
+        gh release upload rdp-data $fd --repo $env:GITHUB_REPOSITORY --clobber
+        Write-Host "[$(Get-Date)] D: drive files saved ($mbd MB, $($ddirs.Count) items)"
+       }
+      }
+     }
+     $fm = "$env:TEMP\apps-meta.tgz"
+     Remove-Item $fm -Force -ErrorAction SilentlyContinue
+     & $tar -czf $fm -C $stage .
+     if (Test-Path $fm) {
+      gh release upload rdp-data $fm --repo $env:GITHUB_REPOSITORY --clobber
+      Write-Host "[$(Get-Date)] Installed apps registry/services saved"
+     }
+     Set-Content -Path "C:\apps-sig.txt" -Value $sig -NoNewline
+     exit 0
+     '@ | Set-Content -Path "C:\save-apps.ps1"
+     . "C:\app-lib.ps1"
+     Get-AppState | ConvertTo-Json -Depth 4 -Compress | Set-Content "C:\baseline-apps.json"
+     Write-Host "App baseline le liya."
+     gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern apps-files.tgz --dir $env:TEMP --clobber 2>$null
+     if (Test-Path "$env:TEMP\apps-files.tgz") {
+      & $tar -xzf "$env:TEMP\apps-files.tgz" -C "C:\"
+      Write-Host "Installed apps ki files restore ho gayin."
+     } else { Write-Host "Abhi tak koi captured app nahi hai." }
+     gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern apps-files-d.tgz --dir $env:TEMP --clobber 2>$null
+     if ((Test-Path "$env:TEMP\apps-files-d.tgz") -and (Test-Path "D:\")) {
+      & $tar -xzf "$env:TEMP\apps-files-d.tgz" -C "D:\"
+      Write-Host "D: drive ki files restore ho gayin."
+     }
+     gh release download rdp-data --repo $env:GITHUB_REPOSITORY --pattern apps-meta.tgz --dir $env:TEMP --clobber 2>$null
+     if (Test-Path "$env:TEMP\apps-meta.tgz") {
+      $m = "$env:TEMP\appmeta"
+      Remove-Item $m -Recurse -Force -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path $m | Out-Null
+      & $tar -xzf "$env:TEMP\apps-meta.tgz" -C $m
+      $toStart = @()
+      if (Test-Path "$m\services.json") {
+       foreach ($s in @(Get-Content "$m\services.json" -Raw | ConvertFrom-Json)) {
+        if (-not $s.Name) { continue }
+        if (-not (Get-Service -Name $s.Name -ErrorAction SilentlyContinue)) {
+         $mode = switch ($s.StartMode) { "Auto" { "Automatic" } "Disabled" { "Disabled" } default { "Manual" } }
+         try { New-Service -Name $s.Name -BinaryPathName $s.PathName -DisplayName $s.DisplayName -StartupType $mode | Out-Null; Write-Host "Service bani: $($s.Name)" }
+         catch { Write-Host "Service banane me fail: $($s.Name) -> $_" }
+        }
+        if ($s.StartMode -eq "Auto") { $toStart += $s.Name }
+       }
+      }
+      foreach ($r in @(Get-ChildItem "$m\reg" -Filter "*.reg" -ErrorAction SilentlyContinue)) {
+       reg import $r.FullName 2>&1 | Out-Null
+      }
+      foreach ($n in $toStart) { try { Start-Service -Name $n -ErrorAction Stop } catch { Write-Host "Service start fail: $n" } }
+      if (Test-Path "$m\path.json") {
+       $np = @(Get-Content "$m\path.json" -Raw | ConvertFrom-Json)
+       $parts = @([Environment]::GetEnvironmentVariable("Path", "Machine") -split ';' | Where-Object { $_ })
+       foreach ($p in $np) { if ($p -and ($parts -notcontains $p)) { $parts += $p } }
+       [Environment]::SetEnvironmentVariable("Path", ($parts -join ';'), "Machine")
+      }
+      if (Test-Path "$m\env.json") {
+       $ev = Get-Content "$m\env.json" -Raw | ConvertFrom-Json
+       if ($ev) { foreach ($p in $ev.PSObject.Properties) { [Environment]::SetEnvironmentVariable($p.Name, "$($p.Value)", "Machine") } }
+      }
+      Write-Host "Installed apps ka registry/services/PATH restore ho gaya."
+     }
+     Set-Content -Path "C:\apps-restored.flag" -Value "ok"
+     exit 0
+  - name: Shortcuts and Custom Startup Script
+    run: |
+     @'
+     $ErrorActionPreference = "Continue"
+     $desk = "C:\RDPData\Desktop"
+     New-Item -ItemType Directory -Force -Path $desk | Out-Null
+     $ws = New-Object -ComObject WScript.Shell
+     foreach ($d in $desk, "C:\Users\Public\Desktop") {
+      foreach ($pat in "Visual Studio Code*", "Antigravity*", "Codex*", "ChatGPT*", "Microsoft Edge*", "Firefox*", "Google Chrome*") {
+       Get-ChildItem $d -Filter "$pat.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+      }
+     }
+     $c = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+     if (-not (Test-Path $c)) { $c = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" }
+     if (Test-Path $c) {
+      $lnk = $ws.CreateShortcut("$desk\Google Chrome.lnk")
+      $lnk.TargetPath = $c
+      $lnk.WorkingDirectory = Split-Path $c
+      $lnk.Save()
+      Write-Host "Google Chrome: shortcut ban gaya"
+     } else { Write-Host "Chrome exe nahi mila, shortcut skip" }
+     exit 0
+     '@ | Set-Content -Path "C:\make-shortcuts.ps1"
+     & "C:\make-shortcuts.ps1"
+     # custom hook: C:\RDPData\startup.ps1 har start par chalega (machine-wide settings yahan daalo)
+     if (Test-Path "C:\RDPData\startup.ps1") {
+      Write-Host "Running C:\RDPData\startup.ps1"
+      try { & "C:\RDPData\startup.ps1" } catch { Write-Host "startup.ps1 fail: $_" }
+     }
+     exit 0
+  - name: Establish Tailscale Connection
+    run: |
+     $ErrorActionPreference = "Continue"
+     $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+     if (-not (Test-Path $ts)) { Write-Error "tailscale.exe nahi mila"; exit 1 }
+     function Get-TsIp {
+      try {
+       $st = (cmd /c "`"$ts`" status --json 2>nul") | Out-String | ConvertFrom-Json
+       if ($st.BackendState -eq "Running" -and $st.TailscaleIPs) {
+        return @($st.TailscaleIPs | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })[0]
+       }
+      } catch {}
+      return $null
+     }
+     $tsIP = $null
+     for ($i = 0; $i -lt 15 -and -not $tsIP; $i++) {
+      $tsIP = Get-TsIp
+      if (-not $tsIP) { Start-Sleep -Seconds 3 }
+     }
+     if ($tsIP) {
+      Write-Host "Saved login chal gaya. IP: $tsIP"
+     } else {
+      Write-Host "Saved login expire/invalid, naya login link bana rahe hain..."
+      $out = "$env:TEMP\ts_out.txt"; $err = "$env:TEMP\ts_err.txt"
+      Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+      $p = Start-Process $ts -ArgumentList "up","--unattended","--reset","--force-reauth","--accept-dns=false","--hostname=snck-rdp" `
+       -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
+      $link = $null; $text = ""
+      for ($i = 0; $i -lt 60 -and -not $link; $i++) {
+       Start-Sleep -Seconds 2
+       $text = "$(Get-Content $out -Raw -ErrorAction SilentlyContinue)`n$(Get-Content $err -Raw -ErrorAction SilentlyContinue)"
+       if ($text -match 'https://login\.tailscale\.com/\S+') { $link = $Matches[0] }
+       elseif ($p.HasExited) { break }
+      }
+      if ($link) {
+       Write-Host "`n=============================="
+       Write-Host " TAILSCALE LOGIN LINK:"
+       Write-Host " $link"
+       Write-Host "==============================`n"
+      } else {
+       Write-Host "---- tailscale output ----"; Write-Host $text
+       & $ts status
+      }
+      for ($i = 0; $i -lt 120 -and -not $tsIP; $i++) {
+       Start-Sleep -Seconds 5
+       $tsIP = Get-TsIp
+      }
+      if (-not $tsIP) { Write-Host "Login nahi hua, IP nahi mila"; exit 1 }
+     }
+     echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+     Start-Sleep -Seconds 2
+     if (Test-Path "C:\save-ts.ps1") { & "C:\save-ts.ps1" }
+     exit 0
+  - name: Network Latency Tweaks
+    run: |
+     $ErrorActionPreference = "Continue"
+     try {
+      $ifs = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+      foreach ($i in @(Get-ChildItem $ifs -ErrorAction SilentlyContinue)) {
+       Set-ItemProperty -Path $i.PSPath -Name "TcpAckFrequency" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+       Set-ItemProperty -Path $i.PSPath -Name "TCPNoDelay" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+      }
+      Write-Host "TCP low-latency settings applied."
+     } catch { Write-Host "TCP tweak fail: $_" }
+     try { & "$env:ProgramFiles\Tailscale\tailscale.exe" status } catch {}
+     exit 0
+  - name: Verify RDP Accessibility
+    run: |
+     Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+     $ok = $false
+     for ($i = 0; $i -lt 5 -and -not $ok; $i++) {
+      $ok = (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
+      if (-not $ok) { Start-Sleep -Seconds 3 }
+     }
+     if (-not $ok) {
+      Write-Error "RDP port 3389 not listening"
+      exit 1
+     }
+     Write-Host "RDP port 3389 up!"
+  - name: Make Sure Chrome Is Installed (background)
+    run: |
+     @'
+     $ErrorActionPreference = "Continue"
+     function Log($m) { "[$(Get-Date -Format T)] $m" | Add-Content "C:\bg-install.log" }
+     $c64 = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+     $c32 = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+     if ((Test-Path $c64) -or (Test-Path $c32)) { Log "Chrome already present, skip" }
+     else {
+      Log "installing chrome"
+      choco install googlechrome -y --no-progress 2>&1 | Out-File "C:\bg-choco-chrome.log"
+      Log "chrome exit: $LASTEXITCODE"
+     }
+     & "C:\make-shortcuts.ps1" | Out-Null
+     Log "bg install done"
+     '@ | Set-Content -Path "C:\bg-install.ps1"
+     Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\bg-install.ps1"
+     Write-Host "Chrome check background me shuru, RDP ready hai."
+  - name: Maintain Connection
+    timeout-minutes: 340
+    run: |
+     Write-Host "`n=== RDP ACCESS ==="
+     Write-Host "Address: $env:TAILSCALE_IP"
+     Write-Host "Username: $env:RDP_USER"
+     Write-Host "Password: $env:RDP_PASS"
+     Write-Host "==================`n"
+     try { (Get-Process -Id $PID).PriorityClass = "BelowNormal" } catch {}
+     $n = 0
+     while ($true) {
+      Write-Host "[$(Get-Date)] RDP Active"
+      if (($n -lt 15) -and (Test-Path "C:\bg-install.log")) { Get-Content "C:\bg-install.log" -Tail 2 | ForEach-Object { Write-Host "  bg: $_" } }
+      Start-Sleep -Seconds 60
+      $n++
+      if (Test-Path "C:\RDPData\Desktop\save-now.txt") {
+       Remove-Item "C:\RDPData\Desktop\save-now.txt" -Force -ErrorAction SilentlyContinue
+       Write-Host "save-now.txt mila, abhi full save kar rahe hain"
+       if (Test-Path "C:\save-apps.ps1") { & "C:\save-apps.ps1" }
+       & "C:\save-data.ps1"
+      }
+      if ($n % 10 -eq 0 -and (Test-Path "C:\save-apps.ps1")) { & "C:\save-apps.ps1" }
+      if ($n % 15 -eq 0) { & "C:\save-data.ps1" }
+     }
+  - name: Final Save (cancel par bhi chalega)
+    if: always()
+    run: |
+     $names = "chrome","msedge","firefox","brave","opera","vivaldi","Code","Antigravity","Discord","DiscordPTB","DiscordCanary","Update","Telegram","Spotify","slack","notepad++","Unity Hub","Unity"
+     Get-Process -Name $names -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
+     Start-Sleep -Seconds 6
+     Get-Process -Name $names -ErrorAction SilentlyContinue | Stop-Process -Force
+     Start-Sleep -Seconds 2
+     if (Test-Path "C:\save-apps.ps1") { & "C:\save-apps.ps1" }
+     if (Test-Path "C:\save-data.ps1") { & "C:\save-data.ps1" }
+     exit 0
